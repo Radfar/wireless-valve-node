@@ -1,3 +1,4 @@
+//RF receiver logic for a valve node, using RCSwitch and output pins to operate a valve actuator.
 // 0:D3
 // 1:TX,
 // 2:D4(on board LED) ,
