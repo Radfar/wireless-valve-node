@@ -24,13 +24,12 @@
 #include <PubSubClient.h>
 
 // ---- User config — fill in before flashing ----
-const char* WIFI_SSID     = "YOUR_SSID";
-const char* WIFI_PASSWORD = "YOUR_PASSWORD";
-const char* MQTT_HOST     = "192.168.x.x";
+const char* WIFI_SSID     = "Galaxy A10s7258";
+const char* WIFI_PASSWORD = "pnus0281";
+const char* MQTT_HOST     = "192.168.80.143";
 const uint16_t MQTT_PORT  = 1883;
 const char* MQTT_TOPIC    = "zone4/soil01/data";
 const char* NODE_ID       = "soil01";
-
 // ---- Pins ----
 const uint8_t SENSOR_POWER_PIN = D5;   // GPIO14 — switches sensor VCC on/off
 const uint8_t SENSOR_ADC_PIN   = A0;   // only analog pin on the ESP8266
@@ -40,7 +39,7 @@ const int ADC_DRY = 780;   // raw analogRead() in open dry air
 const int ADC_WET = 360;   // raw analogRead() fully submerged in water
 
 // ---- Sleep interval — trade battery life for data freshness here ----
-const uint64_t SLEEP_SECONDS = 600; // 10 minutes
+const uint64_t SLEEP_SECONDS = 15; //600 for 10 minutes, for testing 15sec
 
 // ---- RTC memory block for fast WiFi reconnect across deep-sleep cycles ----
 struct RtcData {
