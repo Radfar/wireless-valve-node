@@ -19,187 +19,159 @@
   Monitoring battery voltage too would need an analog mux or a second board —
   left as a known gap, not solved here.
 */
-#include <Arduino.h>
 #include <ESP8266WiFi.h>
+#include <WiFiManager.h>
 #include <PubSubClient.h>
+#include <LittleFS.h>
 
-// ---- User config — fill in before flashing ----
-const char* WIFI_SSID     = "Galaxy";
-const char* WIFI_PASSWORD = "pnus0281";
-const char* MQTT_HOST     = "192.168.64.105";
-const uint16_t MQTT_PORT  = 1883;
-const char* MQTT_TOPIC    = "zone4/soil01/data";
-const char* NODE_ID       = "soil01";
+// ---- Fixed settings ----
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_TOPIC   = "zone4/soil01/data";
+const char* NODE_ID      = "soil01";
+const uint64_t SLEEP_SECONDS = 15;     // use 600 for battery
+#define USE_DEEP_SLEEP 0               // set 1 only when D2 (GPIO16) is wired to RST
+const uint8_t MAX_FAILS_BEFORE_PORTAL = 5;
+
 // ---- Pins ----
-const uint8_t SENSOR_POWER_PIN = D5;   // GPIO14 — switches sensor VCC on/off
-const uint8_t SENSOR_ADC_PIN   = A0;   // only analog pin on the ESP8266
+const uint8_t SENSOR_POWER_PIN = D5;
+const uint8_t SENSOR_ADC_PIN   = A0;
+const uint8_t CONFIG_PIN       = D3;   // hold to GND while resetting -> setup portal
 
-// ---- Calibration — replace with YOUR sensor's own dry-air / water-immersion readings ----
-const int ADC_DRY = 780;   // raw analogRead() in open dry air
-const int ADC_WET = 360;   // raw analogRead() fully submerged in water
+// ---- Calibration ----
+const int ADC_DRY = 780;
+const int ADC_WET = 360;
 
-// ---- Sleep interval — trade battery life for data freshness here ----
-const uint64_t SLEEP_SECONDS = 15; //600 for 10 minutes, for testing 15sec
-
-// ---- RTC memory block for fast WiFi reconnect across deep-sleep cycles ----
-struct RtcData {
-  uint32_t magic;
-  uint8_t channel;
-  uint8_t bssid[6];
-};
+struct RtcData { uint32_t magic; uint32_t failCount; };
 RtcData rtcData;
 
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
+String brokerHost;
+
+void loadRtc() {
+  ESP.rtcUserMemoryRead(0, (uint32_t*)&rtcData, sizeof(rtcData));
+  if (rtcData.magic != 0xA5A5A5A5) { rtcData.magic = 0xA5A5A5A5; rtcData.failCount = 0; }
+}
+void saveRtc() { ESP.rtcUserMemoryWrite(0, (uint32_t*)&rtcData, sizeof(rtcData)); }
+
+String loadBrokerHost() {
+  if (!LittleFS.exists("/broker.txt")) return "";
+  File f = LittleFS.open("/broker.txt", "r");
+  String s = f.readStringUntil('\n');
+  f.close();
+  s.trim();
+  return s;
+}
+void saveBrokerHost(const String& h) {
+  File f = LittleFS.open("/broker.txt", "w");
+  f.print(h);
+  f.close();
+}
 
 float readMoisturePercent() {
   digitalWrite(SENSOR_POWER_PIN, HIGH);
-  delay(50); // let the sensor's output settle after power-up
-
+  delay(50);
   long total = 0;
-  const int SAMPLES = 8;
-  for (int i = 0; i < SAMPLES; i++) {
-    total += analogRead(SENSOR_ADC_PIN);
-    delay(10);
-  }
-  int raw = total / SAMPLES;
-
-  digitalWrite(SENSOR_POWER_PIN, LOW); // cut sensor power the moment we're done reading
-
+  for (int i = 0; i < 8; i++) { total += analogRead(SENSOR_ADC_PIN); delay(10); }
+  digitalWrite(SENSOR_POWER_PIN, LOW);
+  int raw = total / 8;
   float pct = (float)(ADC_DRY - raw) / (float)(ADC_DRY - ADC_WET) * 100.0;
-  if (pct < 0)   pct = 0;
+  if (pct < 0) pct = 0;
   if (pct > 100) pct = 100;
   return pct;
 }
 
-bool connectWiFiFast() {
-  WiFi.mode(WIFI_STA);
-  WiFi.persistent(false); // avoid wearing out flash with repeated config writes
-
-  ESP.rtcUserMemoryRead(0, (uint32_t*)&rtcData, sizeof(rtcData));
-  bool haveCache = (rtcData.magic == 0xA5A5A5A5);
-
-  if (haveCache) {
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD, rtcData.channel, rtcData.bssid, true);
-  } else {
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  }
-
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(100);
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    rtcData.magic = 0xA5A5A5A5;
-    rtcData.channel = WiFi.channel();
-    memcpy(rtcData.bssid, WiFi.BSSID(), 6);
-    ESP.rtcUserMemoryWrite(0, (uint32_t*)&rtcData, sizeof(rtcData));
-    return true;
-  }
-  return false; // no cache saved on failure — next boot falls back to a full scan
-}
-
 void goToSleep() {
-  WiFi.disconnect(true);
-  delay(10);
-  ESP.deepSleep(SLEEP_SECONDS * 1000000ULL); // deepSleep takes microseconds
+  saveRtc();
+  // NOTE: do not call WiFi.disconnect() here. On ESP8266 it erases the saved credentials.
+#if USE_DEEP_SLEEP
+  ESP.deepSleep(SLEEP_SECONDS * 1000000ULL);
+#else
+  delay(SLEEP_SECONDS * 1000UL);
+  ESP.restart();
+#endif
 }
-/*
-void setup() {
-  pinMode(SENSOR_POWER_PIN, OUTPUT);
-  digitalWrite(SENSOR_POWER_PIN, LOW);
 
-  float moisture = readMoisturePercent();
+bool runSetupPortal() {
+  char hostBuf[40];
+  strncpy(hostBuf, brokerHost.c_str(), sizeof(hostBuf) - 1);
+  hostBuf[sizeof(hostBuf) - 1] = 0;
+  WiFiManagerParameter pHost("broker", "MQTT broker (IP or hostname)", hostBuf, 40);
 
-  if (connectWiFiFast()) {
-    mqtt.setServer(MQTT_HOST, MQTT_PORT);
-    if (mqtt.connect(NODE_ID)) {
-      char payload[64];
-      snprintf(payload, sizeof(payload), "{\"moisture\":%.1f}", moisture);
-      mqtt.publish(MQTT_TOPIC, payload);
-      mqtt.disconnect();
-    }
+  WiFiManager wm;
+  wm.addParameter(&pHost);
+  wm.setConfigPortalTimeout(180);
+  String apName = "SoilNode-" + String(ESP.getChipId(), HEX);
+  Serial.println("Opening setup portal: " + apName);
+
+  bool ok = wm.startConfigPortal(apName.c_str());
+  if (ok) {
+    String h = pHost.getValue();
+    h.trim();
+    if (h.length() > 0) { brokerHost = h; saveBrokerHost(h); }
   }
-  // If WiFi or MQTT connect failed, we just skip publishing this cycle and
-  // sleep anyway — don't burn battery retrying every cycle.
-
-  goToSleep();
+  return ok;
 }
-*/
+
+bool connectStored() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin();   // uses credentials saved in flash
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) delay(100);
+  return WiFi.status() == WL_CONNECTED;
+}
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(200);
+  pinMode(SENSOR_POWER_PIN, OUTPUT);
+  digitalWrite(SENSOR_POWER_PIN, LOW);
+  pinMode(CONFIG_PIN, INPUT_PULLUP);
 
-  Serial.println();
-  Serial.println("ESP8266 Wi-Fi/MQTT diagnostic");
-  Serial.print("Connecting to SSID: ");
-  Serial.println(WIFI_SSID);
+  LittleFS.begin();
+  brokerHost = loadBrokerHost();
+  loadRtc();
 
-  WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
-  WiFi.setSleepMode(WIFI_NONE_SLEEP);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  bool forceConfig  = (digitalRead(CONFIG_PIN) == LOW);
+  bool noConfig     = (WiFi.SSID().length() == 0) || (brokerHost.length() == 0);
+  bool tooManyFails = (rtcData.failCount >= MAX_FAILS_BEFORE_PORTAL);
 
-  unsigned long start = millis();
-
-  while (WiFi.status() != WL_CONNECTED &&
-         millis() - start < 20000) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("Wi-Fi CONNECTED");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("Signal strength (RSSI): ");
-    Serial.println(WiFi.RSSI());
-
-    mqtt.setServer(MQTT_HOST, MQTT_PORT);
-
-    Serial.println("Connecting to MQTT broker...");
-    WiFiClient testClient;
-
-    Serial.print("TCP test to broker: ");
-    Serial.println(
-    testClient.connect(MQTT_HOST, MQTT_PORT)
-    ? "SUCCESS"
-    : "FAILED"
-    );
-
-    testClient.stop();
-    if (mqtt.connect(NODE_ID)) {
-      Serial.println("MQTT CONNECTED");
-
-      float moisture = readMoisturePercent();
-      char payload[64];
-      snprintf(payload, sizeof(payload),
-               "{\"moisture\":%.1f}", moisture);
-
-      bool published = mqtt.publish(MQTT_TOPIC, payload);
-
-      Serial.print("Publish result: ");
-      Serial.println(published ? "SUCCESS" : "FAILED");
-
-      mqtt.disconnect();
-    } else {
-      Serial.print("MQTT FAILED, state = ");
-      Serial.println(mqtt.state());
-    }
+  bool connected;
+  if (forceConfig || noConfig || tooManyFails) {
+    rtcData.failCount = 0;
+    connected = runSetupPortal();
   } else {
-    Serial.print("Wi-Fi FAILED, status = ");
-    Serial.println((int)WiFi.status());
+    connected = connectStored();
   }
+
+  if (!connected) {
+    rtcData.failCount++;
+    Serial.println("No WiFi, sleeping");
+    goToSleep();
+    return;
+  }
+  rtcData.failCount = 0;
+
+  Serial.print("WiFi OK, IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.println("Broker: " + brokerHost);
+
+  float moisture = readMoisturePercent();
+  mqtt.setServer(brokerHost.c_str(), MQTT_PORT);
+  if (mqtt.connect(NODE_ID)) {
+    char payload[64];
+    snprintf(payload, sizeof(payload), "{\"moisture\":%.1f}", moisture);
+    bool ok = mqtt.publish(MQTT_TOPIC, payload);
+    Serial.println(ok ? "Published" : "Publish FAILED");
+    mqtt.loop();
+    delay(100);
+    mqtt.disconnect();
+  } else {
+    Serial.print("MQTT FAILED, state = ");
+    Serial.println(mqtt.state());
+  }
+  goToSleep();
 }
 
-void loop() {
-  delay(1000);
-}
-/*
-void loop() {
-  // never reached — deep sleep resets the chip, execution restarts at setup()
-}*/
+void loop() {}
