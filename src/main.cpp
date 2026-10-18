@@ -24,9 +24,9 @@
 #include <PubSubClient.h>
 
 // ---- User config — fill in before flashing ----
-const char* WIFI_SSID     = "Galaxy A10s7258";
+const char* WIFI_SSID     = "Galaxy";
 const char* WIFI_PASSWORD = "pnus0281";
-const char* MQTT_HOST     = "192.168.80.143";
+const char* MQTT_HOST     = "192.168.64.105";
 const uint16_t MQTT_PORT  = 1883;
 const char* MQTT_TOPIC    = "zone4/soil01/data";
 const char* NODE_ID       = "soil01";
@@ -105,7 +105,7 @@ void goToSleep() {
   delay(10);
   ESP.deepSleep(SLEEP_SECONDS * 1000000ULL); // deepSleep takes microseconds
 }
-
+/*
 void setup() {
   pinMode(SENSOR_POWER_PIN, OUTPUT);
   digitalWrite(SENSOR_POWER_PIN, LOW);
@@ -126,7 +126,80 @@ void setup() {
 
   goToSleep();
 }
+*/
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("ESP8266 Wi-Fi/MQTT diagnostic");
+  Serial.print("Connecting to SSID: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - start < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Wi-Fi CONNECTED");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Signal strength (RSSI): ");
+    Serial.println(WiFi.RSSI());
+
+    mqtt.setServer(MQTT_HOST, MQTT_PORT);
+
+    Serial.println("Connecting to MQTT broker...");
+    WiFiClient testClient;
+
+    Serial.print("TCP test to broker: ");
+    Serial.println(
+    testClient.connect(MQTT_HOST, MQTT_PORT)
+    ? "SUCCESS"
+    : "FAILED"
+    );
+
+    testClient.stop();
+    if (mqtt.connect(NODE_ID)) {
+      Serial.println("MQTT CONNECTED");
+
+      float moisture = readMoisturePercent();
+      char payload[64];
+      snprintf(payload, sizeof(payload),
+               "{\"moisture\":%.1f}", moisture);
+
+      bool published = mqtt.publish(MQTT_TOPIC, payload);
+
+      Serial.print("Publish result: ");
+      Serial.println(published ? "SUCCESS" : "FAILED");
+
+      mqtt.disconnect();
+    } else {
+      Serial.print("MQTT FAILED, state = ");
+      Serial.println(mqtt.state());
+    }
+  } else {
+    Serial.print("Wi-Fi FAILED, status = ");
+    Serial.println((int)WiFi.status());
+  }
+}
 
 void loop() {
-  // never reached — deep sleep resets the chip, execution restarts at setup()
+  delay(1000);
 }
+/*
+void loop() {
+  // never reached — deep sleep resets the chip, execution restarts at setup()
+}*/
